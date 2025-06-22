@@ -1,3 +1,8 @@
+/* 
+ * SIMULATION ONLY - NOT FOR REAL AIRCRAFT USE 
+ * This is an educational example of flight control logic.
+ */
+
 #include <stdbool.h>
 
 typedef struct {
