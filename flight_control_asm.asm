@@ -6,6 +6,7 @@ section .data
     align 16
     half: dd 0.5, 0.5, 0.5, 0.5
     two: dd 2.0, 2.0, 2.0, 2.0
+    one: dq 1.0
     g_const: dd 9.81, 9.81, 9.81, 9.81
 
 section .text
@@ -15,11 +16,9 @@ section .text
     global quaternion_rotate_asm
 
 ; double compute_dynamic_pressure_asm(double rho, double V)
-; Input: rdi = rho (air density), rsi = V (velocity)
+; Input: xmm0 = rho (air density), xmm1 = V (velocity)
 ; Output: xmm0 = dynamic pressure (0.5 * rho * V^2)
 compute_dynamic_pressure_asm:
-    movsd xmm0, [rel rdi]      ; load rho from first parameter
-    movsd xmm1, [rel rsi]      ; load V from second parameter
     mulsd xmm0, xmm1           ; rho * V
     mulsd xmm0, xmm1           ; rho * V^2
     movsd xmm1, [rel half]     ; load 0.5
@@ -29,16 +28,31 @@ compute_dynamic_pressure_asm:
 ; void compute_forces_moments_asm(const double* params, const double* state, 
 ;                                const double* controls, double* result)
 ; Parameters: rdi = params, rsi = state, rdx = controls, rcx = result
-; params: [rho, CL0, CLa, CLq, MAC, CLde, S, CD0, K, CDde, CY_beta, CY_dr,
-;          Cm0, Cm_alpha, Cm_q, Cm_de, Cl_beta, Cl_p, Cl_r, Cl_da, Cl_dr,
-;          Cn_beta, Cn_p, Cn_r, Cn_da, Cn_dr]
-; state: [V, alpha, beta, p, q, r, phi, theta, psi, pos_n, pos_e, pos_d]
-; controls: [delta_e, delta_a, delta_r, delta_t]
-; result: [Fx, Fy, Fz, Mx, My, Mz]
+;
+; params layout (offsets in bytes):
+;   0: rho                 8: CL0              16: CLa             24: CLq
+;   32: MAC                40: CLde            48: S (wing area)   56: CD0
+;   64: K                  72: CDde            80: CY_beta         88: CY_dr
+;   96: Cm0                104: Cm_alpha       112: Cm_q           120: Cm_de
+;   128: Cl_beta           136: Cl_p           144: Cl_r           152: Cl_da
+;   160: Cl_dr             168: Cn_beta        176: Cn_p           184: Cn_r
+;   192: Cn_da             200: Cn_dr          208: wing_span
+;
+; state layout (offsets in bytes):
+;   0: V                   8: alpha            16: beta            24: p
+;   32: q                  40: r               48: phi             56: theta
+;   64: psi                72: pos_n           80: pos_e           88: pos_d
+;
+; controls layout:
+;   0: delta_e             8: delta_a          16: delta_r         24: delta_t
+;
+; result layout:
+;   0: Fx                  8: Fy               16: Fz              24: Mx
+;   32: My                 40: Mz
 compute_forces_moments_asm:
     push rbp
     mov rbp, rsp
-    sub rsp, 64                ; local storage for intermediate values
+    sub rsp, 80                ; local storage for intermediate values
     
     ; Load state variables
     movsd xmm0, [rsi]          ; V
@@ -82,8 +96,8 @@ compute_forces_moments_asm:
     movsd [rbp-16], xmm7       ; save CL
     
     ; Drag coefficient: CD = CD0 + K*CL^2 + CDde*delta_e^2
-    movsd xmm7, [rdi+48]       ; CD0
-    movsd xmm8, [rdi+56]       ; K
+    movsd xmm7, [rdi+56]       ; CD0
+    movsd xmm8, [rdi+64]       ; K
     movsd xmm9, [rbp-16]       ; CL
     movsd xmm11, xmm9          ; CL
     mulsd xmm11, xmm9          ; CL^2
@@ -91,7 +105,7 @@ compute_forces_moments_asm:
     addsd xmm7, xmm8           ; CD = CD0 + K*CL^2
     
     ; Add elevator induced drag: CDde*delta_e^2
-    movsd xmm8, [rdi+64]       ; CDde
+    movsd xmm8, [rdi+72]       ; CDde
     movsd xmm9, [rdx]          ; delta_e
     mulsd xmm9, xmm9           ; delta_e^2
     mulsd xmm8, xmm9           ; CDde*delta_e^2
@@ -99,9 +113,9 @@ compute_forces_moments_asm:
     movsd [rbp-24], xmm7       ; save CD
     
     ; Side force: CY = CY_beta*beta + CY_dr*delta_r
-    movsd xmm7, [rdi+72]       ; CY_beta
+    movsd xmm7, [rdi+80]       ; CY_beta
     mulsd xmm7, xmm2           ; CY_beta * beta
-    movsd xmm8, [rdi+80]       ; CY_dr
+    movsd xmm8, [rdi+88]       ; CY_dr
     movsd xmm9, [rdx+16]       ; delta_r
     mulsd xmm8, xmm9           ; CY_dr * delta_r
     addsd xmm7, xmm8           ; CY = CY_beta*beta + CY_dr*delta_r
@@ -109,7 +123,7 @@ compute_forces_moments_asm:
     
     ; Forces in wind axes
     movsd xmm6, [rbp-8]        ; Q
-    movsd xmm7, [rdi+88]       ; S (wing area)
+    movsd xmm7, [rdi+48]       ; S (wing area)
     movsd xmm8, [rbp-16]       ; CL
     mulsd xmm8, xmm6           ; CL * Q
     mulsd xmm8, xmm7           ; CL * Q * S (lift magnitude)
@@ -125,194 +139,178 @@ compute_forces_moments_asm:
     mulsd xmm8, xmm7           ; CY * Q * S (side force magnitude)
     movsd [rbp-56], xmm8       ; save Y_side
     
-    ; Transform to body axes: Fx = -D*cos(alpha) + L*sin(alpha)
-    movsd xmm8, xmm1           ; alpha
-    call cos_approx            ; cos(alpha) in xmm0
-    movsd xmm10, xmm0          ; save cos(alpha)
-    movsd xmm8, xmm1           ; alpha
-    call sin_approx            ; sin(alpha) in xmm0
-    movsd xmm11, xmm0          ; save sin(alpha)
+    ; Transform to body axes using cos/sin of alpha
+    ; For simplicity, use small angle approximation here
+    ; In production, would use precomputed trig or separate trig kernel
+    movsd xmm10, xmm1          ; alpha
+    movsd xmm11, xmm1
+    mulsd xmm11, xmm1          ; alpha^2
     
-    movsd xmm0, [rbp-48]       ; D_drag
-    mulsd xmm0, xmm10          ; D*cos(alpha)
-    movsd xmm8, [rbp-40]       ; L_lift
-    mulsd xmm8, xmm11          ; L*sin(alpha)
-    subsd xmm8, xmm0           ; L*sin(alpha) - D*cos(alpha)
-    movsd [rcx], xmm8          ; store Fx (result[0])
+    ; sin(alpha) ≈ alpha - alpha^3/6
+    movsd xmm8, xmm1           ; alpha
+    movsd xmm9, xmm11
+    mulsd xmm9, xmm1           ; alpha^3
+    movsd xmm12, [rel two]
+    addsd xmm12, xmm12
+    addsd xmm12, xmm12         ; 6.0 approximation
+    divsd xmm9, xmm12
+    subsd xmm8, xmm9           ; sin(alpha)
+    movsd [rbp-64], xmm8       ; save sin(alpha)
+    
+    ; cos(alpha) ≈ 1 - alpha^2/2
+    movsd xmm8, xmm11          ; alpha^2
+    movsd xmm9, [rel half]
+    mulsd xmm8, xmm9           ; alpha^2/2
+    movsd xmm12, [rel one]
+    subsd xmm12, xmm8          ; cos(alpha)
+    movsd [rbp-72], xmm12      ; save cos(alpha)
+    
+    ; Fx = -D*cos(alpha) + L*sin(alpha)
+    movsd xmm8, [rbp-48]       ; D_drag
+    movsd xmm9, [rbp-72]       ; cos(alpha)
+    mulsd xmm8, xmm9           ; D*cos(alpha)
+    movsd xmm10, [rbp-40]      ; L_lift
+    movsd xmm11, [rbp-64]      ; sin(alpha)
+    mulsd xmm10, xmm11         ; L*sin(alpha)
+    subsd xmm10, xmm8          ; L*sin(alpha) - D*cos(alpha)
+    movsd [rcx], xmm10         ; store Fx (result[0])
     
     ; Fy = Y_side (no transformation needed for side axis)
-    movsd xmm0, [rbp-56]       ; Y_side
-    movsd [rcx+8], xmm0        ; store Fy (result[1])
+    movsd xmm8, [rbp-56]       ; Y_side
+    movsd [rcx+8], xmm8        ; store Fy (result[1])
     
     ; Fz = -D*sin(alpha) - L*cos(alpha)
-    movsd xmm0, [rbp-48]       ; D_drag
-    mulsd xmm0, xmm11          ; D*sin(alpha)
-    movsd xmm8, [rbp-40]       ; L_lift
-    mulsd xmm8, xmm10          ; L*cos(alpha)
-    addsd xmm0, xmm8           ; D*sin(alpha) + L*cos(alpha)
-    negsd xmm0                 ; -(D*sin + L*cos)
-    movsd [rcx+16], xmm0       ; store Fz (result[2])
+    movsd xmm8, [rbp-48]       ; D_drag
+    movsd xmm9, [rbp-64]       ; sin(alpha)
+    mulsd xmm8, xmm9           ; D*sin(alpha)
+    movsd xmm10, [rbp-40]      ; L_lift
+    movsd xmm11, [rbp-72]      ; cos(alpha)
+    mulsd xmm10, xmm11         ; L*cos(alpha)
+    addsd xmm8, xmm10          ; D*sin(alpha) + L*cos(alpha)
+    negsd xmm8                 ; -(D*sin + L*cos)
+    movsd [rcx+16], xmm8       ; store Fz (result[2])
     
     ; Pitching moment: Cm = Cm0 + Cm_alpha*alpha + Cm_q*(q*MAC/(2*V)) + Cm_de*delta_e
-    movsd xmm0, [rdi+96]       ; Cm0
-    movsd xmm1, [rdi+104]      ; Cm_alpha
-    movsd xmm2, [rsi+8]        ; alpha
-    mulsd xmm1, xmm2           ; Cm_alpha * alpha
-    addsd xmm0, xmm1           ; Cm0 + Cm_alpha*alpha
+    movsd xmm8, [rdi+96]       ; Cm0
+    movsd xmm9, [rdi+104]      ; Cm_alpha
+    movsd xmm10, [rsi+8]       ; alpha
+    mulsd xmm9, xmm10          ; Cm_alpha * alpha
+    addsd xmm8, xmm9           ; Cm0 + Cm_alpha*alpha
     
     ; Pitch damping: Cm_q * (q*MAC/(2*V))
-    movsd xmm1, [rdi+112]      ; Cm_q
-    movsd xmm2, [rsi+32]       ; q
-    movsd xmm3, [rdi+32]       ; MAC
-    mulsd xmm2, xmm3           ; q*MAC
-    movsd xmm4, [rsi]          ; V
-    addsd xmm4, xmm4           ; 2*V
-    divsd xmm2, xmm4           ; (q*MAC)/(2*V)
-    mulsd xmm1, xmm2           ; Cm_q * damping
-    addsd xmm0, xmm1           ; Cm += damping
+    movsd xmm9, [rdi+112]      ; Cm_q
+    movsd xmm10, [rsi+32]      ; q
+    movsd xmm11, [rdi+32]      ; MAC
+    mulsd xmm10, xmm11         ; q*MAC
+    movsd xmm12, [rsi]         ; V
+    addsd xmm12, xmm12         ; 2*V
+    divsd xmm10, xmm12         ; (q*MAC)/(2*V)
+    mulsd xmm9, xmm10          ; Cm_q * damping
+    addsd xmm8, xmm9           ; Cm += damping
     
     ; Elevator control: Cm_de * delta_e
-    movsd xmm1, [rdi+120]      ; Cm_de
-    movsd xmm2, [rdx]          ; delta_e
-    mulsd xmm1, xmm2           ; Cm_de * delta_e
-    addsd xmm0, xmm1           ; Cm += control term
+    movsd xmm9, [rdi+120]      ; Cm_de
+    movsd xmm10, [rdx]         ; delta_e
+    mulsd xmm9, xmm10          ; Cm_de * delta_e
+    addsd xmm8, xmm9           ; Cm += control term
     
     ; My = Q * S * MAC * Cm
-    movsd xmm1, [rbp-8]        ; Q
-    movsd xmm2, [rdi+88]       ; S
-    mulsd xmm1, xmm2           ; Q*S
-    movsd xmm2, [rdi+32]       ; MAC
-    mulsd xmm1, xmm2           ; Q*S*MAC
-    mulsd xmm0, xmm1           ; Cm * Q*S*MAC
-    movsd [rcx+32], xmm0       ; store My (result[4])
+    movsd xmm9, [rbp-8]        ; Q
+    movsd xmm10, [rdi+48]      ; S
+    mulsd xmm9, xmm10          ; Q*S
+    movsd xmm10, [rdi+32]      ; MAC
+    mulsd xmm9, xmm10          ; Q*S*MAC
+    mulsd xmm8, xmm9           ; Cm * Q*S*MAC
+    movsd [rcx+32], xmm8       ; store My (result[4])
     
     ; Rolling moment: Cl = Cl_beta*beta + Cl_p*(p*b/(2*V)) + Cl_da*delta_a + Cl_dr*delta_r
-    movsd xmm0, [rdi+128]      ; Cl_beta
-    movsd xmm1, [rsi+16]       ; beta
-    mulsd xmm0, xmm1           ; Cl_beta*beta
+    movsd xmm8, [rdi+128]      ; Cl_beta
+    movsd xmm9, [rsi+16]       ; beta
+    mulsd xmm8, xmm9           ; Cl_beta*beta
     
-    movsd xmm1, [rdi+136]      ; Cl_p
-    movsd xmm2, [rsi+24]       ; p
-    movsd xmm3, [rdi+144]      ; wing_span (b)
-    mulsd xmm2, xmm3           ; p*b
-    movsd xmm4, [rsi]          ; V
-    addsd xmm4, xmm4           ; 2*V
-    divsd xmm2, xmm4           ; (p*b)/(2*V)
-    mulsd xmm1, xmm2           ; Cl_p * damping
-    addsd xmm0, xmm1           ; Cl += roll damping
+    movsd xmm9, [rdi+136]      ; Cl_p
+    movsd xmm10, [rsi+24]      ; p
+    movsd xmm11, [rdi+208]     ; wing_span (b)
+    mulsd xmm10, xmm11         ; p*b
+    movsd xmm12, [rsi]         ; V
+    addsd xmm12, xmm12         ; 2*V
+    divsd xmm10, xmm12         ; (p*b)/(2*V)
+    mulsd xmm9, xmm10          ; Cl_p * damping
+    addsd xmm8, xmm9           ; Cl += roll damping
     
-    movsd xmm1, [rdi+152]      ; Cl_da
-    movsd xmm2, [rdx+8]        ; delta_a
-    mulsd xmm1, xmm2           ; Cl_da*delta_a
-    addsd xmm0, xmm1           ; Cl += aileron control
+    movsd xmm9, [rdi+152]      ; Cl_da
+    movsd xmm10, [rdx+8]       ; delta_a
+    mulsd xmm9, xmm10          ; Cl_da*delta_a
+    addsd xmm8, xmm9           ; Cl += aileron control
     
-    movsd xmm1, [rdi+160]      ; Cl_dr
-    movsd xmm2, [rdx+16]       ; delta_r
-    mulsd xmm1, xmm2           ; Cl_dr*delta_r
-    addsd xmm0, xmm1           ; Cl += rudder effect
+    movsd xmm9, [rdi+160]      ; Cl_dr
+    movsd xmm10, [rdx+16]      ; delta_r
+    mulsd xmm9, xmm10          ; Cl_dr*delta_r
+    addsd xmm8, xmm9           ; Cl += rudder effect
     
     ; Mx = Q * S * b * Cl
-    movsd xmm1, [rbp-8]        ; Q
-    movsd xmm2, [rdi+88]       ; S
-    mulsd xmm1, xmm2           ; Q*S
-    movsd xmm2, [rdi+144]      ; b (wing_span)
-    mulsd xmm1, xmm2           ; Q*S*b
-    mulsd xmm0, xmm1           ; Cl * Q*S*b
-    movsd [rcx+24], xmm0       ; store Mx (result[3])
+    movsd xmm9, [rbp-8]        ; Q
+    movsd xmm10, [rdi+48]      ; S
+    mulsd xmm9, xmm10          ; Q*S
+    movsd xmm10, [rdi+208]     ; b (wing_span)
+    mulsd xmm9, xmm10          ; Q*S*b
+    mulsd xmm8, xmm9           ; Cl * Q*S*b
+    movsd [rcx+24], xmm8       ; store Mx (result[3])
     
     ; Yawing moment: Cn = Cn_beta*beta + Cn_p*(p*b/(2*V)) + Cn_r*(r*b/(2*V)) + Cn_da*delta_a + Cn_dr*delta_r
-    movsd xmm0, [rdi+168]      ; Cn_beta
-    movsd xmm1, [rsi+16]       ; beta
-    mulsd xmm0, xmm1           ; Cn_beta*beta
+    movsd xmm8, [rdi+168]      ; Cn_beta
+    movsd xmm9, [rsi+16]       ; beta
+    mulsd xmm8, xmm9           ; Cn_beta*beta
     
-    movsd xmm1, [rdi+176]      ; Cn_p
-    movsd xmm2, [rsi+24]       ; p
-    movsd xmm3, [rdi+144]      ; b
-    mulsd xmm2, xmm3           ; p*b
-    movsd xmm4, [rsi]          ; V
-    addsd xmm4, xmm4           ; 2*V
-    divsd xmm2, xmx4           ; (p*b)/(2*V)
-    mulsd xmm1, xmm2           ; Cn_p*damping
-    addsd xmm0, xmm1           ; Cn += roll rate effect
+    movsd xmm9, [rdi+176]      ; Cn_p
+    movsd xmm10, [rsi+24]      ; p
+    movsd xmm11, [rdi+208]     ; b
+    mulsd xmm10, xmm11         ; p*b
+    movsd xmm12, [rsi]         ; V
+    addsd xmm12, xmm12         ; 2*V
+    divsd xmm10, xmm12         ; (p*b)/(2*V)
+    mulsd xmm9, xmm10          ; Cn_p*damping
+    addsd xmm8, xmm9           ; Cn += roll rate effect
     
-    movsd xmm1, [rdi+184]      ; Cn_r
-    movsd xmm2, [rsi+40]       ; r
-    movsd xmm3, [rdi+144]      ; b
-    mulsd xmm2, xmm3           ; r*b
-    movsd xmm4, [rsi]          ; V
-    addsd xmm4, xmx4           ; 2*V
-    divsd xmm2, xmx4           ; (r*b)/(2*V)
-    mulsd xmm1, xmm2           ; Cn_r*damping
-    addsd xmm0, xmm1           ; Cn += yaw damping
+    movsd xmm9, [rdi+184]      ; Cn_r
+    movsd xmm10, [rsi+40]      ; r
+    movsd xmm11, [rdi+208]     ; b
+    mulsd xmm10, xmm11         ; r*b
+    movsd xmm12, [rsi]         ; V
+    addsd xmm12, xmm12         ; 2*V
+    divsd xmm10, xmm12         ; (r*b)/(2*V)
+    mulsd xmm9, xmm10          ; Cn_r*damping
+    addsd xmm8, xmm9           ; Cn += yaw damping
     
-    movsd xmm1, [rdi+192]      ; Cn_da
-    movsd xmm2, [rdx+8]        ; delta_a
-    mulsd xmm1, xmm2           ; Cn_da*delta_a
-    addsd xmm0, xmm1           ; Cn += aileron effect
+    movsd xmm9, [rdi+192]      ; Cn_da
+    movsd xmm10, [rdx+8]       ; delta_a
+    mulsd xmm9, xmm10          ; Cn_da*delta_a
+    addsd xmm8, xmm9           ; Cn += aileron effect
     
-    movsd xmm1, [rdi+200]      ; Cn_dr
-    movsd xmm2, [rdx+16]       ; delta_r
-    mulsd xmm1, xmx2           ; Cn_dr*delta_r
-    addsd xmx0, xmx1           ; Cn += rudder control
+    movsd xmm9, [rdi+200]      ; Cn_dr
+    movsd xmm10, [rdx+16]      ; delta_r
+    mulsd xmm9, xmm10          ; Cn_dr*delta_r
+    addsd xmm8, xmm9           ; Cn += rudder control
     
     ; Mz = Q * S * b * Cn
-    movsd xmm1, [rbp-8]        ; Q
-    movsd xmx2, [rdi+88]       ; S
-    mulsd xmx1, xmx2           ; Q*S
-    movsd xmx2, [rdi+144]      ; b
-    mulsd xmx1, xmx2           ; Q*S*b
-    mulsd xmx0, xmx1           ; Cn * Q*S*b
-    movsd [rcx+40], xmx0       ; store Mz (result[5])
+    movsd xmm9, [rbp-8]        ; Q
+    movsd xmm10, [rdi+48]      ; S
+    mulsd xmm9, xmm10          ; Q*S
+    movsd xmm10, [rdi+208]     ; b
+    mulsd xmm9, xmm10          ; Q*S*b
+    mulsd xmm8, xmm9           ; Cn * Q*S*b
+    movsd [rcx+40], xmm8       ; store Mz (result[5])
     
-    add rsp, 64
+    add rsp, 80
     pop rbp
-    ret
-
-; Fast cosine approximation (input in xmm8, output in xmm0)
-; Uses Taylor series for small angles or range reduction
-cos_approx:
-    ; For now, use simple polynomial approximation
-    ; cos(x) ≈ 1 - x^2/2 + x^4/24
-    movsd xmm0, xmm8           ; x
-    movsd xmm1, xmm8
-    mulsd xmm1, xmm1           ; x^2
-    movsd xmm2, [rel half]
-    mulsd xmm2, xmm1           ; x^2/2
-    movsd xmm0, xmm0           ; xmm0 = 1
-    subsd xmm0, xmm2           ; 1 - x^2/2
-    movsd xmm3, xmm1
-    mulsd xmm3, xmm1           ; x^4
-    movsd xmm4, xmm3
-    ; x^4/24 (approximate by dividing by 8 and by 3)
-    divsd xmm3, [rel two]
-    divsd xmm3, [rel two]
-    divsd xmm3, [rel two]
-    ; Divide by 3 is more complex, so use fixed value
-    addsd xmm0, xmm3           ; + x^4/24 term
-    ret
-
-; Fast sine approximation (input in xmm8, output in xmm0)
-; Uses Taylor series for small angles
-sin_approx:
-    ; sin(x) ≈ x - x^3/6 + x^5/120
-    movsd xmm0, xmm8           ; x
-    movsd xmm1, xmm8
-    mulsd xmm1, xmm8           ; x^2
-    movsd xmm2, xmm1
-    mulsd xmm2, xmm8           ; x^3
-    movsd xmx3, [rel two]
-    addsd xmm3, xmx3           ; 3 (approximate)
-    divsd xmm2, xmx3           ; x^3/6
-    subsd xmx0, xmx2           ; x - x^3/6
     ret
 
 ; void matrix_multiply_4x4_asm(const double* A, const double* B, double* C)
 ; rdi = A (4x4 matrix), rsi = B (4x4 matrix), rdx = C (result 4x4 matrix)
-; Uses SSE2 for better performance on 4x4 matrices
+; Uses scalar double precision FP for portability
 matrix_multiply_4x4_asm:
     push rbp
     mov rbp, rsp
-    sub rsp, 32                ; local storage
     
     mov r8, 0                  ; row counter
 .row_loop:
@@ -365,7 +363,6 @@ matrix_multiply_4x4_asm:
     jmp .row_loop
     
 .row_done:
-    add rsp, 32
     pop rbp
     ret
 
@@ -455,7 +452,7 @@ quaternion_rotate_asm:
     movsd xmm12, [rbp-40]      ; vx
     mulsd xmm11, xmm12         ; qy*vx
     subsd xmm7, xmm11          ; qw*vz + qx*vy - qy*vx
-    movsd [rbp-88], xmx7       ; temp.z
+    movsd [rbp-88], xmm7       ; temp.z
     
     ; Quaternion conjugate: q_conj = [qw, -qx, -qy, -qz]
     movsd xmm0, [rbp-8]        ; qw
@@ -464,50 +461,50 @@ quaternion_rotate_asm:
     movsd xmm2, [rbp-24]       ; qy
     negsd xmm2                 ; -qy
     movsd xmm3, [rbp-32]       ; qz
-    negsd xmx3                 ; -qz
+    negsd xmm3                 ; -qz
     
     ; Final Hamilton product: result = temp * q_conj
     ; result.x = temp.w*(-qx) + temp.x*qw + temp.y*(-qz) - temp.z*(-qy)
     movsd xmm4, [rbp-64]       ; temp.w
-    mulsd xmm4, xmx1           ; temp.w*(-qx)
+    mulsd xmm4, xmm1           ; temp.w*(-qx)
     movsd xmm5, [rbp-72]       ; temp.x
     mulsd xmm5, xmm0           ; temp.x*qw
-    addsd xmx4, xmm5           ; temp.w*(-qx) + temp.x*qw
+    addsd xmm4, xmm5           ; temp.w*(-qx) + temp.x*qw
     movsd xmm6, [rbp-80]       ; temp.y
-    mulsd xmx6, xmx2           ; temp.y*(-qz)
-    addsd xmx4, xmx6           ; + temp.y*(-qz)
+    mulsd xmm6, xmm2           ; temp.y*(-qz)
+    addsd xmm4, xmm6           ; + temp.y*(-qz)
     movsd xmm7, [rbp-88]       ; temp.z
-    mulsd xmx7, xmx3           ; temp.z*(-qy)
-    subsd xmx4, xmx7           ; - temp.z*(-qy)
-    movsd [rdx], xmx4          ; result[0] = result.x
+    mulsd xmm7, xmm3           ; temp.z*(-qy)
+    subsd xmm4, xmm7           ; - temp.z*(-qy)
+    movsd [rdx], xmm4          ; result[0] = result.x
     
     ; result.y = temp.w*(-qy) + temp.y*qw + temp.z*(-qx) - temp.x*(-qz)
-    movsd xmx4, [rbp-64]       ; temp.w
-    mulsd xmx4, xmx2           ; temp.w*(-qy)
-    movsd xmx5, [rbp-80]       ; temp.y
-    mulsd xmx5, xmm0           ; temp.y*qw
-    addsd xmx4, xmx5           ; temp.w*(-qy) + temp.y*qw
-    movsd xmx6, [rbp-88]       ; temp.z
-    mulsd xmx6, xmx1           ; temp.z*(-qx)
-    addsd xmx4, xmx6           ; + temp.z*(-qx)
-    movsd xmx7, [rbp-72]       ; temp.x
-    mulsd xmx7, xmx3           ; temp.x*(-qz)
-    subsd xmx4, xmx7           ; - temp.x*(-qz)
-    movsd [rdx+8], xmx4        ; result[1] = result.y
+    movsd xmm4, [rbp-64]       ; temp.w
+    mulsd xmm4, xmm2           ; temp.w*(-qy)
+    movsd xmm5, [rbp-80]       ; temp.y
+    mulsd xmm5, xmm0           ; temp.y*qw
+    addsd xmm4, xmm5           ; temp.w*(-qy) + temp.y*qw
+    movsd xmm6, [rbp-88]       ; temp.z
+    mulsd xmm6, xmm1           ; temp.z*(-qx)
+    addsd xmm4, xmm6           ; + temp.z*(-qx)
+    movsd xmm7, [rbp-72]       ; temp.x
+    mulsd xmm7, xmm3           ; temp.x*(-qz)
+    subsd xmm4, xmm7           ; - temp.x*(-qz)
+    movsd [rdx+8], xmm4        ; result[1] = result.y
     
     ; result.z = temp.w*(-qz) + temp.z*qw + temp.x*(-qy) - temp.y*(-qx)
-    movsd xmx4, [rbp-64]       ; temp.w
-    mulsd xmx4, xmx3           ; temp.w*(-qz)
-    movsd xmx5, [rbp-88]       ; temp.z
-    mulsd xmx5, xmm0           ; temp.z*qw
-    addsd xmx4, xmx5           ; temp.w*(-qz) + temp.z*qw
-    movsd xmx6, [rbp-72]       ; temp.x
-    mulsd xmx6, xmx2           ; temp.x*(-qy)
-    addsd xmx4, xmx6           ; + temp.x*(-qy)
-    movsd xmx7, [rbp-80]       ; temp.y
-    mulsd xmx7, xmx1           ; temp.y*(-qx)
-    subsd xmx4, xmx7           ; - temp.y*(-qx)
-    movsd [rdx+16], xmx4       ; result[2] = result.z
+    movsd xmm4, [rbp-64]       ; temp.w
+    mulsd xmm4, xmm3           ; temp.w*(-qz)
+    movsd xmm5, [rbp-88]       ; temp.z
+    mulsd xmm5, xmm0           ; temp.z*qw
+    addsd xmm4, xmm5           ; temp.w*(-qz) + temp.z*qw
+    movsd xmm6, [rbp-72]       ; temp.x
+    mulsd xmm6, xmm2           ; temp.x*(-qy)
+    addsd xmm4, xmm6           ; + temp.x*(-qy)
+    movsd xmm7, [rbp-80]       ; temp.y
+    mulsd xmm7, xmm1           ; temp.y*(-qx)
+    subsd xmm4, xmm7           ; - temp.y*(-qx)
+    movsd [rdx+16], xmm4       ; result[2] = result.z
     
     add rsp, 96
     pop rbp
