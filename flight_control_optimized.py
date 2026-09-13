@@ -3,6 +3,11 @@ import numpy as np
 import flight_control_asm as fca
 from numba import jit, njit
 import ctypes
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class OptimizedFlightControlSimulation:
     def __init__(self):
@@ -13,9 +18,11 @@ class OptimizedFlightControlSimulation:
         """Detect if assembly optimizations are available"""
         try:
             import flight_control_asm
+            logger.info("Assembly optimizations available")
             return True
-        except ImportError:
-            print("Assembly optimizations not available, using Python fallback")
+        except ImportError as e:
+            logger.warning(f"Assembly optimizations not available: {e}")
+            logger.info("Using Python/Numba fallback")
             return False
     
     @njit(fastmath=True)
@@ -53,7 +60,11 @@ class OptimizedFlightControlSimulation:
         return np.array([Fx, Fy, Fz, Mx, My, Mz])
     
     def compute_forces_moments_optimized(self, state, controls):
-        """Use assembly optimization if available, otherwise use Numba"""
+        """Use assembly optimization if available, otherwise use Numba
+        
+        Attempts to call assembly-optimized force/moment calculation.
+        On failure, logs the error and disables assembly for remainder of run.
+        """
         if self.use_asm:
             # Prepare parameters for assembly function
             params = np.array([
@@ -68,11 +79,12 @@ class OptimizedFlightControlSimulation:
                 result = fca.compute_forces_moments(params, state, controls)
                 return result
             except Exception as e:
-                print(f"Assembly optimization failed: {e}, falling back to Numba")
+                logger.error(f"Assembly optimization failed during compute_forces_moments: {type(e).__name__}: {e}")
+                logger.info("Falling back to Numba-optimized Python implementation")
                 self.use_asm = False
-                return self.compute_forces_moments_numba(state, controls)
+                return self.compute_forces_moments_numba(state, controls, params)
         else:
-            return self.compute_forces_moments_numba(state, controls)
+            return self.compute_forces_moments_numba(state, controls, params)
     
     @staticmethod
     @njit
@@ -92,17 +104,25 @@ class OptimizedFlightControlSimulation:
     @staticmethod
     @njit
     def fast_quaternion_rotate(q, v):
-        """Optimized quaternion rotation"""
+        """Optimized quaternion rotation using Hamilton product
+        
+        Performs rotation: v' = q * v * q_conjugate
+        where v is converted to pure quaternion [0, vx, vy, vz]
+        
+        Args:
+            q: quaternion [w, x, y, z]
+            v: vector [x, y, z]
+        
+        Returns:
+            rotated vector [x', y', z']
+        """
         qw, qx, qy, qz = q
         vx, vy, vz = v
         
         # Convert vector to quaternion
         v_quat = np.array([0, vx, vy, vz])
         
-        # q * v * q_conjugate
-        q_conj = np.array([qw, -qx, -qy, -qz])
-        
-        # Hamilton product: temp = q * v_quat
+        # q * v_quat
         temp = np.array([
             -qx*vx - qy*vy - qz*vz,
             qw*vx + qy*vz - qz*vy,
@@ -110,7 +130,8 @@ class OptimizedFlightControlSimulation:
             qw*vz + qx*vy - qy*vx
         ])
         
-        # result = temp * q_conj
+        # q_conjugate = [qw, -qx, -qy, -qz]
+        # temp * q_conjugate
         result = np.array([
             -temp[1]*qx - temp[2]*qy - temp[3]*qz,
             temp[0]*qx + temp[2]*qz - temp[3]*qy,
@@ -118,7 +139,7 @@ class OptimizedFlightControlSimulation:
             temp[0]*qz + temp[1]*qy - temp[2]*qx
         ])
         
-        return result[1:]  # Return vector part
+        return result[1:]  # Return vector part [x', y', z']
     
     def optimized_aircraft_dynamics(self, t, state):
         """Optimized version of aircraft dynamics"""
@@ -188,7 +209,11 @@ class OptimizedFlightControlSimulation:
     @staticmethod
     @njit
     def compute_rotation_matrix_fast(phi, theta, psi):
-        """Optimized rotation matrix calculation"""
+        """Optimized rotation matrix calculation
+        
+        Computes body-to-inertial rotation matrix from Euler angles.
+        Applies ZYX rotation sequence (yaw, pitch, roll).
+        """
         cos_phi = np.cos(phi)
         sin_phi = np.sin(phi)
         cos_theta = np.cos(theta)
@@ -233,10 +258,10 @@ def benchmark_optimizations():
         for _ in range(10000):
             sim.compute_forces_moments_optimized(state, controls)
         asm_time = time.time() - start
-        print(f"Python: {python_time:.4f}s, Assembly: {asm_time:.4f}s")
-        print(f"Speedup: {python_time/asm_time:.2f}x")
+        logger.info(f"Python: {python_time:.4f}s, Assembly: {asm_time:.4f}s")
+        logger.info(f"Speedup: {python_time/asm_time:.2f}x")
     else:
-        print(f"Python time: {python_time:.4f}s")
+        logger.info(f"Python time: {python_time:.4f}s")
 
 if __name__ == "__main__":
     benchmark_optimizations()
