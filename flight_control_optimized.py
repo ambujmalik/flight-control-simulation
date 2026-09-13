@@ -27,7 +27,16 @@ class OptimizedFlightControlSimulation:
     
     @njit(fastmath=True)
     def compute_forces_moments_numba(self, state, controls, params):
-        """Numba-optimized version for fallback"""
+        """Numba-optimized version for fallback
+        
+        Args:
+            state: 12-element array [V, alpha, beta, p, q, r, phi, theta, psi, pos_n, pos_e, pos_d]
+            controls: 4-element array [delta_e, delta_a, delta_r, delta_t]
+            params: 26-element array of aerodynamic coefficients
+        
+        Returns:
+            6-element array [Fx, Fy, Fz, Mx, My, Mz]
+        """
         V, alpha, beta, p, q, r, phi, theta, psi, pos_n, pos_e, pos_d = state
         delta_e, delta_a, delta_r, delta_t = controls
         
@@ -59,22 +68,21 @@ class OptimizedFlightControlSimulation:
         
         return np.array([Fx, Fy, Fz, Mx, My, Mz])
     
-    def compute_forces_moments_optimized(self, state, controls):
+    def compute_forces_moments_optimized(self, state, controls, params):
         """Use assembly optimization if available, otherwise use Numba
         
         Attempts to call assembly-optimized force/moment calculation.
         On failure, logs the error and disables assembly for remainder of run.
+        
+        Args:
+            state: 12-element array [V, alpha, beta, p, q, r, phi, theta, psi, pos_n, pos_e, pos_d]
+            controls: 4-element array [delta_e, delta_a, delta_r, delta_t]
+            params: 26-element array of aerodynamic coefficients
+        
+        Returns:
+            6-element array [Fx, Fy, Fz, Mx, My, Mz]
         """
         if self.use_asm:
-            # Prepare parameters for assembly function
-            params = np.array([
-                self.atmosphere.isa_density(-self.position_d),  # rho
-                self.aircraft.wing_area,
-                self.aircraft.wing_span,
-                self.aircraft.mean_aerodynamic_chord,
-                # Add more parameters as needed
-            ])
-            
             try:
                 result = fca.compute_forces_moments(params, state, controls)
                 return result
@@ -89,7 +97,15 @@ class OptimizedFlightControlSimulation:
     @staticmethod
     @njit
     def fast_matrix_multiply(A, B):
-        """Optimized matrix multiplication"""
+        """Optimized matrix multiplication
+        
+        Args:
+            A: MxN matrix
+            B: NxP matrix
+        
+        Returns:
+            MxP result matrix
+        """
         m, n = A.shape
         n, p = B.shape
         C = np.zeros((m, p))
@@ -110,7 +126,7 @@ class OptimizedFlightControlSimulation:
         where v is converted to pure quaternion [0, vx, vy, vz]
         
         Args:
-            q: quaternion [w, x, y, z]
+            q: quaternion [w, x, y, z] (must be normalized)
             v: vector [x, y, z]
         
         Returns:
@@ -145,9 +161,18 @@ class OptimizedFlightControlSimulation:
         """Optimized version of aircraft dynamics"""
         V, alpha, beta, p, q, r, phi, theta, psi, pos_n, pos_e, pos_d = state
         
+        # Prepare parameters for force/moment calculation
+        params = np.array([
+            self.atmosphere.isa_density(-pos_d),  # rho
+            self.aircraft.wing_area,
+            self.aircraft.wing_span,
+            self.aircraft.mean_aerodynamic_chord,
+            # Add remaining parameters as needed
+        ])
+        
         # Use optimized force/moment calculation
         controls = np.array([self.delta_e, self.delta_a, self.delta_r, self.delta_t])
-        F, M = self.compute_forces_moments_optimized(state, controls)
+        F, M = self.compute_forces_moments_optimized(state, controls, params)
         Fx, Fy, Fz = F
         Mx, My, Mz = M
         
@@ -183,9 +208,9 @@ class OptimizedFlightControlSimulation:
         # (Rotation matrix calculation optimized in the main class)
         
         # Convert force derivatives to state derivatives
-        Vdot = (u * udot + v * vdot + w * wdot) / V
-        alphadot = (u * wdot - w * udot) / (u * u + w * w)
-        betadot = (V * vdot - v * Vdot) / (V * V * np.cos(beta))
+        Vdot = (u * udot + v * vdot + w * wdot) / V if V != 0 else 0.0
+        alphadot = (u * wdot - w * udot) / (u * u + w * w) if (u * u + w * w) != 0 else 0.0
+        betadot = (V * vdot - v * Vdot) / (V * V * np.cos(beta)) if (V != 0 and np.cos(beta) != 0) else 0.0
         
         # Euler angle derivatives
         tan_theta = np.tan(theta)
@@ -195,7 +220,7 @@ class OptimizedFlightControlSimulation:
         
         phidot = p + (q * sin_phi + r * cos_phi) * tan_theta
         thetadot = q * cos_phi - r * sin_phi
-        psidot = (q * sin_phi + r * cos_phi) / cos_theta
+        psidot = (q * sin_phi + r * cos_phi) / cos_theta if cos_theta != 0 else 0.0
         
         # Position derivatives
         # Use precomputed rotation matrix or optimized calculation
@@ -213,6 +238,14 @@ class OptimizedFlightControlSimulation:
         
         Computes body-to-inertial rotation matrix from Euler angles.
         Applies ZYX rotation sequence (yaw, pitch, roll).
+        
+        Args:
+            phi: roll angle (rad)
+            theta: pitch angle (rad)
+            psi: yaw angle (rad)
+        
+        Returns:
+            3x3 rotation matrix
         """
         cos_phi = np.cos(phi)
         sin_phi = np.sin(phi)
@@ -245,18 +278,19 @@ def benchmark_optimizations():
     sim = OptimizedFlightControlSimulation()
     state = np.random.randn(12)
     controls = np.random.randn(4)
+    params = np.array([1.225, 125, 35, 4.5, 0.024, 0.045])  # rho, S, b, MAC, CD0, K
     
     # Benchmark Python version
     start = time.time()
     for _ in range(10000):
-        sim.compute_forces_moments_numba(state, controls, np.array([1.225, 125, 35, 4.5]))
+        sim.compute_forces_moments_numba(state, controls, params)
     python_time = time.time() - start
     
     # Benchmark optimized version
     if sim.use_asm:
         start = time.time()
         for _ in range(10000):
-            sim.compute_forces_moments_optimized(state, controls)
+            sim.compute_forces_moments_optimized(state, controls, params)
         asm_time = time.time() - start
         logger.info(f"Python: {python_time:.4f}s, Assembly: {asm_time:.4f}s")
         logger.info(f"Speedup: {python_time/asm_time:.2f}x")
